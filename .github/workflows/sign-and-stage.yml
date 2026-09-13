@@ -1,0 +1,392 @@
+# Signing an approved Windows build, and staging it as a draft.
+#
+# This workflow belongs in the **public** repository,
+# KeystoneCore/station-ops-releases, and not in the private source repository.
+# That is not a preference; it is the only place the protection can exist.
+#
+# GitHub's documentation: "Users with GitHub Free plans can only configure
+# environments for public repositories." KeystoneCore is on the Free plan and
+# the source repository is private, so an `environment:` named there is
+# decorative — no required reviewer, no approval, no gate. The key would sit in
+# a job that checks out an arbitrary commit and runs its scripts.
+#
+# Here, environments work.
+#
+# ## The key-bearing job's execution boundary, in full
+#
+# The signing job runs **nothing from the candidate application**. Not a
+# script, not a binary, not a build. Specifically:
+#
+#   * it does not check out the private source repository at all;
+#   * it checks out only this repository, which is where this file lives and
+#     where changes to it are reviewed;
+#   * every command it runs is written here, in this file, inline. There is no
+#     `tool/sign-update.sh` in scope and nothing to pin, because nothing
+#     outside this file executes;
+#   * the only things it takes from the candidate are **files**: the installer
+#     and the application bundle, downloaded as artifacts. They are hashed,
+#     compared against a digest the operator supplies, zipped and uploaded.
+#     Nothing in them is executed;
+#   * every input and every artifact name is passed through `env:` and quoted.
+#     Nothing from an input or a filename reaches a command line by
+#     interpolation.
+#
+# A previous version of this pinned the SHA-256 of the signing script. That was
+# not enough: the job also ran other scripts from the same checkout, and any of
+# them could have read the key out of the environment.
+#
+# ## Fail closed
+#
+# The `guard` job runs first, holds no secrets, and refuses if this
+# repository's `release-signing` environment has no required reviewer. The
+# signing job `needs:` it, so a missing protection stops the run before the
+# key is ever in scope.
+
+name: Sign and stage a Windows release
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: 'The Manual platform builds run holding the artifacts.'
+        type: string
+        required: false
+      source_sha:
+        description: 'Full 40-character commit that run built.'
+        type: string
+        required: false
+      version:
+        description: 'Product version, e.g. 0.1.0+3. Must match the installer.'
+        type: string
+        required: false
+      installer_sha256:
+        description: 'SHA-256 of the installer, from the build run summary.'
+        type: string
+        required: false
+      schema:
+        description: 'Document schema version that build carries, for the notes.'
+        type: string
+        required: false
+      channel:
+        description: Which channel this release is for.
+        type: choice
+        options: [alpha, stable]
+        default: alpha
+        required: true
+      tag_prefix:
+        description: >-
+          Empty for a real release. "trial-" for the two-version update trial: such tags do not parse as versions, so the ordinary feeds skip them.
+        type: string
+        default: ''
+        required: false
+      dry_run:
+        description: >-
+          Prove the approval gate and stop. The job waits for a reviewer as usual, reports that the pause was reached and approved, and exits without touching a secret, an artifact or a release. Use this before any signing key exists, to establish that the pause is real.
+        type: boolean
+        default: false
+        required: false
+# Nothing here writes to the source repository, and nothing reads anything it
+# does not need.
+permissions: {}
+env:
+  SOURCE_REPO: KeystoneCore/station-apps
+jobs:
+  # No secrets. Its only job is to refuse when the gate is not real.
+  guard:
+    name: Check the signing gate exists
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Nothing. `GET /repos/{owner}/{repo}/environments/{name}` is documented as
+    # readable by "anyone with read access to the repository", and this
+    # repository is public — verified against live repositories, where
+    # `protection_rules` including `required_reviewers` comes back to an
+    # unauthenticated caller. No administration permission is needed and none
+    # is taken; a credential that could read environment configuration across
+    # the account would be a larger thing than the one it guards.
+    permissions: {}
+    steps:
+      - name: The environment must actually protect something
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+
+          # Separated from the body so that "the request failed" and "there is
+          # no protection" are told apart. Both refuse; only one of them means
+          # somebody forgot to configure a reviewer.
+          status="$(curl -sS -o response.json -w '%{http_code}' \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/environments/release-signing" \
+            || echo '000')"
+
+          case "$status" in
+            200) ;;
+            404)
+              echo "::error::There is no release-signing environment on this repository. A job naming an environment that does not exist gets one created with no protection at all, so this refuses instead. Create it with a required reviewer."
+              exit 1
+              ;;
+            403)
+              echo "::error::Reading the release-signing environment was refused (403). Without being able to confirm a reviewer is required, this cannot let a signing job run."
+              exit 1
+              ;;
+            000)
+              echo "::error::Could not reach the GitHub API to check the signing gate. Refusing rather than assuming."
+              exit 1
+              ;;
+            *)
+              echo "::error::Checking the signing gate returned HTTP $status. Refusing."
+              sed -n '1,20p' response.json
+              exit 1
+              ;;
+          esac
+
+          # A malformed or unexpected body is not a yes either.
+          if ! jq -e 'type == "object"' response.json >/dev/null 2>&1; then
+            echo "::error::The environment response was not an object. Refusing."
+            exit 1
+          fi
+          if ! jq -e 'has("protection_rules")' response.json >/dev/null 2>&1; then
+            echo "::error::The environment response carries no protection_rules field. This check cannot confirm a reviewer is required, so it refuses."
+            exit 1
+          fi
+
+          reviewers="$(jq -r '[.protection_rules[]? | select(.type == "required_reviewers")] | length' response.json 2>/dev/null)"
+          if [ "${reviewers:-0}" -lt 1 ] 2>/dev/null; then
+            present="$(jq -r '[.protection_rules[]?.type] | join(", ")' response.json 2>/dev/null)"
+            echo "::error::release-signing has no required reviewer (rules present: ${present:-none}). Approval is the gate; a wait timer and a branch restriction are not. Refusing."
+            exit 1
+          fi
+
+          echo "release-signing requires a reviewer. Proceeding to a job that can reach the key."
+  sign:
+    name: Sign and stage
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Where the key lives, and where a person approves this run having seen
+    # which build it is for.
+    environment: release-signing
+    permissions:
+      # Releases live under contents. Nothing else is needed.
+      contents: write
+    steps:
+      # This repository only. The private source is never checked out here.
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Read the request, and believe none of it yet
+        shell: bash
+        env:
+          IN_RUN_ID: ${{ inputs.source_run_id }}
+          IN_SHA: ${{ inputs.source_sha }}
+          IN_VERSION: ${{ inputs.version }}
+          IN_DIGEST: ${{ inputs.installer_sha256 }}
+          IN_SCHEMA: ${{ inputs.schema }}
+          IN_PREFIX: ${{ inputs.tag_prefix }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          # The gate test. Reaching this line at all means the environment
+          # paused the job and a person approved it — there is no other way
+          # into this step. Said plainly, and stopped, so that proving the
+          # pause does not require reading it out of a failure further down.
+          if [ "$DRY_RUN" = "true" ]; then
+            {
+              echo "### The approval gate works"
+              echo ""
+              echo "This job reached its first step, which it can only do after"
+              echo "\`release-signing\` paused it and a reviewer approved."
+              echo ""
+              echo "| | |"
+              echo "|---|---|"
+              echo "| Environment | \`release-signing\` |"
+              echo "| Approved by | @$GITHUB_ACTOR |"
+              echo "| Secrets used | none |"
+              echo "| Artifacts fetched | none |"
+              echo "| Releases touched | none |"
+              echo ""
+              echo "Nothing was signed and no key was needed. Provisioning one"
+              echo "is the next step, now that the pause has been demonstrated."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "Dry run: the approval gate was reached and approved. Stopping here."
+            exit 0
+          fi
+
+          # Every input is a string somebody typed. Each is checked against a
+          # shape before it is used anywhere, and none of them is ever
+          # interpolated into a command line by the workflow renderer.
+          printf '%s' "$IN_RUN_ID"  | grep -Eq '^[0-9]+$'            || { echo "::error::run id must be digits."; exit 1; }
+          printf '%s' "$IN_SHA"     | grep -Eq '^[0-9a-f]{40}$'      || { echo "::error::sha must be 40 hex characters."; exit 1; }
+          printf '%s' "$IN_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+$' || { echo "::error::version must be major.minor.patch+build."; exit 1; }
+          printf '%s' "$IN_DIGEST"  | grep -Eq '^[0-9a-f]{64}$'      || { echo "::error::installer_sha256 must be 64 hex characters."; exit 1; }
+          printf '%s' "$IN_SCHEMA"  | grep -Eq '^[0-9]{1,4}$'        || { echo "::error::schema must be digits."; exit 1; }
+          printf '%s' "$IN_PREFIX"  | grep -Eq '^[a-z-]{0,16}$'      || { echo "::error::tag_prefix may only be lowercase letters and hyphens."; exit 1; }
+
+          {
+            echo "RUN_ID=$IN_RUN_ID"
+            echo "SOURCE_SHA=$IN_SHA"
+            echo "VERSION=$IN_VERSION"
+            echo "WANT_DIGEST=$IN_DIGEST"
+            echo "SCHEMA=$IN_SCHEMA"
+            echo "TAG=${IN_PREFIX}v${IN_VERSION}"
+            echo "SHORT_SHA=$(printf '%s' "$IN_SHA" | cut -c1-7)"
+          } >> "$GITHUB_ENV"
+      - name: Fetch the approved artifacts
+        shell: bash
+        env:
+          # Read-only, and only on the source repository's Actions artifacts.
+          GH_TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::SOURCE_READ_TOKEN is not set. See the note in this workflow."
+            exit 1
+          fi
+
+          info="$(gh run view "$RUN_ID" --repo "$SOURCE_REPO" \
+            --json headSha,conclusion,workflowName)"
+          got_sha="$(printf '%s' "$info" | jq -r .headSha)"
+          conclusion="$(printf '%s' "$info" | jq -r .conclusion)"
+          workflow="$(printf '%s' "$info" | jq -r .workflowName)"
+
+          [ "$conclusion" = "success" ] || { echo "::error::Run $RUN_ID concluded '$conclusion'."; exit 1; }
+          [ "$got_sha" = "$SOURCE_SHA" ] || { echo "::error::Run $RUN_ID built $got_sha, not $SOURCE_SHA."; exit 1; }
+          [ "$workflow" = "Manual platform builds" ] || { echo "::error::Run $RUN_ID is '$workflow', not a platform build."; exit 1; }
+
+          mkdir -p staged bundle
+          gh run download "$RUN_ID" --repo "$SOURCE_REPO" \
+            -n "station-ops-windows-installer-$SHORT_SHA" --dir staged
+          gh run download "$RUN_ID" --repo "$SOURCE_REPO" \
+            -n "station-ops-windows-bundle-$SHORT_SHA" --dir bundle
+      - name: Hold the artifacts to what was approved
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd staged
+
+          # Exactly one installer, named for the version and the source. The
+          # name is derived here rather than trusted from the artifact.
+          expected="StationOps-Setup-${VERSION%%+*}-${VERSION##*+}-$SHORT_SHA.exe"
+          count="$(find . -maxdepth 1 -name 'StationOps-Setup-*.exe' | wc -l)"
+          [ "$count" = "1" ] || { echo "::error::Expected one installer, found $count."; exit 1; }
+          [ -f "$expected" ] || { echo "::error::The installer is not '$expected'. The version, the build or the source does not match."; exit 1; }
+
+          # The bytes, against the digest the operator approved. This is the
+          # check that ties a signature to a specific reviewed build rather
+          # than to whatever an artifact happened to contain.
+          actual="$(sha256sum "$expected" | cut -d' ' -f1)"
+          if [ "$actual" != "$WANT_DIGEST" ]; then
+            echo "::error::The installer's SHA-256 is $actual, not the approved $WANT_DIGEST. Nothing has been signed."
+            exit 1
+          fi
+          echo "Installer matches the approved digest."
+          echo "INSTALLER=$expected" >> "$GITHUB_ENV"
+
+          # The bundle executable's architecture, from its own bytes. No file
+          # from the candidate is executed; this reads the PE header.
+          app="../bundle/station_ops.exe"
+          [ -f "$app" ] || { echo "::error::No station_ops.exe in the bundle."; exit 1; }
+          described="$(file -b "$app")"
+          case "$described" in
+            *PE32+*x86-64*) echo "Bundle executable is x86-64." ;;
+            *) echo "::error::The bundle executable is not x64: $described"; exit 1 ;;
+          esac
+
+          # WinSparkle must be there, or the release cannot ever update itself.
+          [ -f "../bundle/WinSparkle.dll" ] || { echo "::error::The bundle carries no WinSparkle.dll."; exit 1; }
+      - name: Sign the installer
+        shell: bash
+        env:
+          # The 32-byte Ed25519 seed, base64. An environment secret, reachable
+          # only after the approval this job waited for.
+          EDDSA_PRIVATE_KEY: ${{ secrets.EDDSA_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${EDDSA_PRIVATE_KEY:-}" ]; then
+            echo "::error::EDDSA_PRIVATE_KEY is not set on the release-signing environment. Nothing has been staged."
+            exit 1
+          fi
+
+          # Inline, on purpose. Nothing from the candidate application runs in
+          # this step, and there is no repository script to pin because none is
+          # used. WinSparkle verifies a raw Ed25519 signature over the whole
+          # installer (v0.9.4, src/signatureverifier.cpp); the private key it
+          # is made with is the 32-byte seed winsparkle-tool writes, which is
+          # an RFC 8032 Ed25519 private key, which is what openssl takes.
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          chmod 700 "$work"
+
+          printf '%s' "$EDDSA_PRIVATE_KEY" | tr -d '[:space:]' | base64 -d > "$work/seed.bin"
+          [ "$(wc -c < "$work/seed.bin")" = "32" ] || { echo "::error::The signing key is not a 32-byte Ed25519 seed."; exit 1; }
+
+          # PKCS#8 for Ed25519: a fixed 16-byte header, then the seed.
+          printf '302e020100300506032b657004220420' | xxd -r -p > "$work/key.der"
+          cat "$work/seed.bin" >> "$work/key.der"
+          openssl pkey -inform DER -in "$work/key.der" -out "$work/key.pem" 2>/dev/null
+
+          openssl pkeyutl -sign -rawin -inkey "$work/key.pem" \
+            -in "staged/$INSTALLER" -out "$work/sig.bin"
+          [ "$(wc -c < "$work/sig.bin")" = "64" ] || { echo "::error::Produced a signature that is not 64 bytes."; exit 1; }
+
+          signature="$(base64 -w0 < "$work/sig.bin")"
+          printf '%s  %s\n' "$signature" "$INSTALLER" > "staged/$INSTALLER.eddsa"
+
+          # Proven here, with the public half derived from the same seed, so a
+          # signature that would fail on a station fails on the runner instead.
+          openssl pkey -inform DER -in "$work/key.der" -pubout -out "$work/pub.pem" 2>/dev/null
+          openssl pkeyutl -verify -rawin -pubin -inkey "$work/pub.pem" \
+            -in "staged/$INSTALLER" -sigfile "$work/sig.bin" >/dev/null
+          echo "Signed, and the signature verifies against the key's own public half."
+      - name: Package and stage a draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          ( cd bundle && zip -qr "../staged/StationOps-portable-$VERSION-$SHORT_SHA.zip" . )
+          ( cd staged && sha256sum StationOps-Setup-*.exe StationOps-portable-*.zip > SHA256SUMS.txt )
+
+          cd staged
+          for f in *; do
+            case "$f" in
+              StationOps-Setup-*.exe|StationOps-Setup-*.exe.eddsa|StationOps-portable-*.zip|SHA256SUMS.txt|NOTES.md) ;;
+              *) echo "::error::Refusing to publish unexpected asset '$f'."; exit 1 ;;
+            esac
+          done
+          sha256sum -c SHA256SUMS.txt
+          cd ..
+
+          {
+            echo "**Station Ops $VERSION — $CHANNEL.**"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | \`$VERSION\` |"
+            echo "| Source | \`$SOURCE_SHA\` |"
+            echo "| Architecture | Windows x64 only |"
+            echo "| Document schema | $SCHEMA |"
+            echo "| Update signature | EdDSA (Ed25519) |"
+            echo
+            echo "Download the Setup executable and run it. It installs for your"
+            echo "user only and needs no administrator."
+          } > staged/NOTES.md
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::$TAG already exists. Published assets are immutable: bump the version."
+            exit 1
+          fi
+          prerelease=""
+          if [ "$CHANNEL" = "alpha" ]; then prerelease="--prerelease"; fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "Station Ops $VERSION" \
+            --notes-file staged/NOTES.md \
+            --draft $prerelease \
+            staged/*.exe staged/*.eddsa staged/*.zip staged/SHA256SUMS.txt
+
+          {
+            echo "### Staged"
+            echo ""
+            echo "\`$TAG\` is a **draft**. Open it, check the assets, publish it by hand."
+          } >> "$GITHUB_STEP_SUMMARY"
