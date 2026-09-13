@@ -200,7 +200,12 @@ jobs:
               echo "| | |"
               echo "|---|---|"
               echo "| Environment | \`release-signing\` |"
-              echo "| Approved by | @$GITHUB_ACTOR |"
+              # Deliberately not $GITHUB_ACTOR: that is whoever dispatched the
+              # run, not whoever approved it. GitHub records the approver, and
+              # the run's approvals API is where to read it; naming the actor
+              # here would be a guess that is only right when one person does
+              # both.
+              echo "| Approved by | recorded by GitHub on this run — not inferred here |"
               echo "| Secrets used | none |"
               echo "| Artifacts fetched | none |"
               echo "| Releases touched | none |"
@@ -232,6 +237,10 @@ jobs:
             echo "SHORT_SHA=$(printf '%s' "$IN_SHA" | cut -c1-7)"
           } >> "$GITHUB_ENV"
       - name: Fetch the approved artifacts
+        # A dry run stops before this. `exit 0` in the first step ends that
+        # step, not the job — so every step that touches a secret, an
+        # artifact or a release is guarded explicitly.
+        if: ${{ !inputs.dry_run }}
         shell: bash
         env:
           # Read-only, and only on the source repository's Actions artifacts.
@@ -259,6 +268,10 @@ jobs:
           gh run download "$RUN_ID" --repo "$SOURCE_REPO" \
             -n "station-ops-windows-bundle-$SHORT_SHA" --dir bundle
       - name: Hold the artifacts to what was approved
+        # A dry run stops before this. `exit 0` in the first step ends that
+        # step, not the job — so every step that touches a secret, an
+        # artifact or a release is guarded explicitly.
+        if: ${{ !inputs.dry_run }}
         shell: bash
         run: |
           set -euo pipefail
@@ -295,6 +308,10 @@ jobs:
           # WinSparkle must be there, or the release cannot ever update itself.
           [ -f "../bundle/WinSparkle.dll" ] || { echo "::error::The bundle carries no WinSparkle.dll."; exit 1; }
       - name: Sign the installer
+        # A dry run stops before this. `exit 0` in the first step ends that
+        # step, not the job — so every step that touches a secret, an
+        # artifact or a release is guarded explicitly.
+        if: ${{ !inputs.dry_run }}
         shell: bash
         env:
           # The 32-byte Ed25519 seed, base64. An environment secret, reachable
@@ -339,6 +356,10 @@ jobs:
             -in "staged/$INSTALLER" -sigfile "$work/sig.bin" >/dev/null
           echo "Signed, and the signature verifies against the key's own public half."
       - name: Package and stage a draft
+        # A dry run stops before this. `exit 0` in the first step ends that
+        # step, not the job — so every step that touches a secret, an
+        # artifact or a release is guarded explicitly.
+        if: ${{ !inputs.dry_run }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
