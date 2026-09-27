@@ -23,6 +23,8 @@
 #   * every command it runs is written here, in this file, inline. There is no
 #     `tool/sign-update.sh` in scope and nothing to pin, because nothing
 #     outside this file executes;
+#   * it takes artifacts only from a platform-builds run whose mixed-version
+#     job, F69–F71 against the older build (ADR-0076 §9.2, G2), passed;
 #   * the only things it takes from the candidate are **files**: the installer
 #     and the application bundle, downloaded as artifacts. They are hashed,
 #     compared against a digest the operator supplies, zipped and uploaded.
@@ -261,6 +263,15 @@ jobs:
           [ "$conclusion" = "success" ] || { echo "::error::Run $RUN_ID concluded '$conclusion'."; exit 1; }
           [ "$got_sha" = "$SOURCE_SHA" ] || { echo "::error::Run $RUN_ID built $got_sha, not $SOURCE_SHA."; exit 1; }
           [ "$workflow" = "Manual platform builds" ] || { echo "::error::Run $RUN_ID is '$workflow', not a platform build."; exit 1; }
+
+          # ADR-0076 §9.2, gate G2: the run's mixed-version fixtures, F69–F71
+          # against the older build itself, passed in that run. Its build jobs
+          # need that job, but a run of a commit from before the gate has no
+          # such job, and a run's success says nothing about a job that never
+          # ran. Skipped, cancelled, failed or absent: nothing is signed.
+          gate="$(gh run view "$RUN_ID" --repo "$SOURCE_REPO" --json jobs \
+            --jq '[.jobs[] | select(.name == "Mixed-version fixtures (F69–F71)") | .conclusion] | join(",")')"
+          [ "$gate" = "success" ] || { echo "::error::Run $RUN_ID has no passing 'Mixed-version fixtures (F69–F71)' job (found '${gate:-none}')."; exit 1; }
 
           mkdir -p staged bundle
           gh run download "$RUN_ID" --repo "$SOURCE_REPO" \
