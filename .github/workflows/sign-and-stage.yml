@@ -228,7 +228,9 @@ jobs:
           printf '%s' "$IN_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+$' || { echo "::error::version must be major.minor.patch+build."; exit 1; }
           printf '%s' "$IN_DIGEST"  | grep -Eq '^[0-9a-f]{64}$'      || { echo "::error::installer_sha256 must be 64 hex characters."; exit 1; }
           printf '%s' "$IN_SCHEMA"  | grep -Eq '^[0-9]{1,4}$'        || { echo "::error::schema must be digits."; exit 1; }
-          printf '%s' "$IN_PREFIX"  | grep -Eq '^[a-z-]{0,16}$'      || { echo "::error::tag_prefix may only be lowercase letters and hyphens."; exit 1; }
+          if [ -n "$IN_PREFIX" ]; then
+            printf '%s' "$IN_PREFIX" | grep -Eq '^[a-z-]{1,16}$' || { echo "::error::tag_prefix may only be lowercase letters and hyphens."; exit 1; }
+          fi
 
           {
             echo "RUN_ID=$IN_RUN_ID"
