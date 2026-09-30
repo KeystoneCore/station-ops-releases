@@ -1,6 +1,7 @@
 # Signing a Station Ops release
 
-The workflow that signs an approved Windows build and stages it as a draft is
+The workflow that signs an approved Windows build, collects the matching
+Android, Linux and macOS packages, and stages one cross-platform draft is
 `.github/workflows/sign-and-stage.yml`. It is reviewed alongside the code it
 signs, in the private source repository, and deployed here.
 
@@ -69,7 +70,7 @@ outside until somebody tries.
 
 So before any production key exists, prove the pause:
 
-**Actions → Sign and stage a Windows release → Run workflow**
+**Actions → Sign and stage a Station Ops release → Run workflow**
 
 | Input | Value |
 |---|---|
@@ -123,7 +124,7 @@ could have read it.
 |---|---|
 | Checks out | this repository only. The private source is never on disk |
 | Runs | only commands written in the workflow file itself. No repository script, no build, no `dart`, no `flutter` |
-| Takes from the candidate | two artifacts, as **files**. Hashed, compared against an approved digest, zipped, uploaded. Nothing in them is executed |
+| Takes from the candidate | the matching platform artifacts, as **files**. They are checked, hashed, packaged and uploaded. Nothing in them is executed |
 | Inputs | validated against a shape, then passed through `env:`. No `${{ }}` appears inside any `run:` block |
 | Permissions | `{}` at the top; `contents: read` for the guard; `contents: write` for signing. Nothing else |
 | Secrets | only in the signing job, only after approval |

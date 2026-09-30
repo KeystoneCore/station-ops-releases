@@ -3,35 +3,36 @@
 Installers for **Station Ops**, a maintenance and readiness record for a rescue
 station. This repository holds downloads only: no source code lives here.
 
-## Status: unsigned alpha
+## Status: closed-test alpha
 
 Builds published here are **alpha** builds for named testers. They are:
 
-- **unsigned** — Windows SmartScreen may warn on first run. If it does, choose
-  **More info** → **Run anyway**. Do not switch SmartScreen off;
+- **not store-distributed** — operating systems can show a first-run warning;
+  do not disable their security features;
 - **not qualified for operational use** — nothing here should be relied on for
   a station's real records yet;
-- **Windows 10 or newer, 64-bit only.**
+- packaged separately for Android arm64, Windows x64, Linux x64 and universal
+  macOS (Apple Silicon and Intel).
 
 ## Installing
 
-Take the newest release from the [Releases](../../releases) page and run the
-`StationOps-Setup-*.exe`. It installs for your user only and needs no
-administrator.
+Take the newest release from the [Releases](../../releases) page. Each release
+has a **Downloads** section that names the right file and its current platform
+limitations. Android phones and tablets use the same adaptive arm64 APK; there
+is no separate tablet build.
 
 Check your download against the `SHA256SUMS.txt` published beside it before
 running it.
 
-The portable `.zip` beside each installer is for diagnosis. Install with the
-Setup executable.
+Windows should normally use the Setup executable; its portable zip is for
+diagnosis. macOS uses the universal zip, Linux the x64 tarball, and Android the
+arm64 APK.
 
 ## Your station's records
 
-The installer does not touch them. They live under
-`%APPDATA%\com.keystonecore.station\Station Ops` and stay there through
-install, upgrade and uninstall. Uninstalling is not a way to reset a station,
-and it is not a backup — take your own copy from *Settings → Data on this
-device → Export a copy*.
+An installer or package does not intentionally replace station records.
+Uninstalling is not a way to reset a station, and it is not a backup — take
+your own copy from *Settings → Data and backups → Export a copy* first.
 
 ## Reporting a problem
 

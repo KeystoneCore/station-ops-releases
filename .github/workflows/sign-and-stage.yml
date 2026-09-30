@@ -1,4 +1,5 @@
-# Signing an approved Windows build, and staging it as a draft.
+# Signing an approved Windows build, collecting the matching Android, Linux
+# and macOS builds, and staging one coherent cross-platform draft.
 #
 # This workflow belongs in the **public** repository,
 # KeystoneCore/station-ops-releases, and not in the private source repository.
@@ -44,7 +45,7 @@
 # signing job `needs:` it, so a missing protection stops the run before the
 # key is ever in scope.
 
-name: Sign and stage a Windows release
+name: Sign and stage a Station Ops release
 on:
   workflow_dispatch:
     inputs:
@@ -273,11 +274,17 @@ jobs:
             --jq '[.jobs[] | select(.name == "Mixed-version fixtures (F69–F71)") | .conclusion] | join(",")')"
           [ "$gate" = "success" ] || { echo "::error::Run $RUN_ID has no passing 'Mixed-version fixtures (F69–F71)' job (found '${gate:-none}')."; exit 1; }
 
-          mkdir -p staged bundle
+          mkdir -p staged bundle android linux macos
           gh run download "$RUN_ID" --repo "$SOURCE_REPO" \
             -n "station-ops-windows-installer-$SHORT_SHA" --dir staged
           gh run download "$RUN_ID" --repo "$SOURCE_REPO" \
             -n "station-ops-windows-bundle-$SHORT_SHA" --dir bundle
+          gh run download "$RUN_ID" --repo "$SOURCE_REPO" \
+            -n "station-ops-android-apk-$SHORT_SHA" --dir android
+          gh run download "$RUN_ID" --repo "$SOURCE_REPO" \
+            -n "station-ops-linux-x64-$SHORT_SHA" --dir linux
+          gh run download "$RUN_ID" --repo "$SOURCE_REPO" \
+            -n "station-ops-macos-universal-$SHORT_SHA" --dir macos
       - name: Hold the artifacts to what was approved
         # A dry run stops before this. `exit 0` in the first step ends that
         # step, not the job — so every step that touches a secret, an
@@ -318,6 +325,26 @@ jobs:
 
           # WinSparkle must be there, or the release cannot ever update itself.
           [ -f "../bundle/WinSparkle.dll" ] || { echo "::error::The bundle carries no WinSparkle.dll."; exit 1; }
+
+          # The remaining packages come from the same successful, gated source
+          # run. Check their source-produced digests and exact identities before
+          # they enter the draft. None is executed here.
+          cd ..
+          android_name="StationOps-Android-arm64-${VERSION}-${SHORT_SHA}.apk"
+          linux_name="StationOps-Linux-x64-${VERSION}-${SHORT_SHA}.tar.gz"
+          macos_name="StationOps-macOS-universal-${VERSION}-${SHORT_SHA}.zip"
+          for pair in "android:$android_name" "linux:$linux_name" "macos:$macos_name"; do
+            directory="${pair%%:*}"
+            filename="${pair#*:}"
+            [ -f "$directory/$filename" ] || { echo "::error::Missing $directory package '$filename'."; exit 1; }
+            [ -f "$directory/$filename.sha256" ] || { echo "::error::Missing checksum for '$filename'."; exit 1; }
+            ( cd "$directory" && sha256sum -c "$filename.sha256" )
+            cp "$directory/$filename" "staged/$filename"
+          done
+
+          unzip -Z1 "android/$android_name" | grep -q '^AndroidManifest.xml$' || { echo "::error::Android artifact has no manifest."; exit 1; }
+          tar -tzf "linux/$linux_name" | grep -q '^bundle/station_ops$' || { echo "::error::Linux archive has no Station Ops executable."; exit 1; }
+          unzip -Z1 "macos/$macos_name" | grep -q 'Station Ops.app/Contents/MacOS/Station Ops$' || { echo "::error::macOS archive has no Station Ops app executable."; exit 1; }
       - name: Sign the installer
         # A dry run stops before this. `exit 0` in the first step ends that
         # step, not the job — so every step that touches a secret, an
@@ -378,12 +405,17 @@ jobs:
         run: |
           set -euo pipefail
           ( cd bundle && zip -qr "../staged/StationOps-portable-$VERSION-$SHORT_SHA.zip" . )
-          ( cd staged && sha256sum StationOps-Setup-*.exe StationOps-portable-*.zip > SHA256SUMS.txt )
+          ( cd staged && sha256sum \
+            StationOps-Setup-*.exe \
+            StationOps-portable-*.zip \
+            StationOps-Android-*.apk \
+            StationOps-Linux-*.tar.gz \
+            StationOps-macOS-*.zip > SHA256SUMS.txt )
 
           cd staged
           for f in *; do
             case "$f" in
-              StationOps-Setup-*.exe|StationOps-Setup-*.exe.eddsa|StationOps-portable-*.zip|SHA256SUMS.txt|NOTES.md) ;;
+              StationOps-Setup-*.exe|StationOps-Setup-*.exe.eddsa|StationOps-portable-*.zip|StationOps-Android-*.apk|StationOps-Linux-*.tar.gz|StationOps-macOS-*.zip|SHA256SUMS.txt|NOTES.md) ;;
               *) echo "::error::Refusing to publish unexpected asset '$f'."; exit 1 ;;
             esac
           done
@@ -397,12 +429,41 @@ jobs:
             echo "|---|---|"
             echo "| Version | \`$VERSION\` |"
             echo "| Source | \`$SOURCE_SHA\` |"
-            echo "| Architecture | Windows x64 only |"
+            echo "| Platforms | Android arm64; Windows x64; Linux x64; macOS universal |"
             echo "| Document schema | $SCHEMA |"
             echo "| Update signature | EdDSA (Ed25519) |"
             echo
-            echo "Download the Setup executable and run it. It installs for your"
-            echo "user only and needs no administrator."
+            echo "## Downloads"
+            echo
+            echo "### Android phone and tablet"
+            echo
+            echo "Download the **Android arm64 APK**. The same adaptive app is for"
+            echo "phones and tablets; there is no separate tablet APK. This pilot"
+            echo "package is signed with a stable sideload identity so later pilot"
+            echo "builds can install over it."
+            echo
+            echo "### Windows"
+            echo
+            echo "Download the **Setup executable**. It installs for your user only"
+            echo "and needs no administrator. The portable zip is for diagnosis."
+            echo
+            echo "### macOS"
+            echo
+            echo "Download the **macOS universal zip** for Apple Silicon or Intel."
+            echo "This pilot archive is not Developer ID signed or notarized yet,"
+            echo "so macOS can require explicit approval the first time it opens."
+            echo
+            echo "### Linux"
+            echo
+            echo "Download the **Linux x64 tar.gz**, extract it, and run"
+            echo "\`bundle/station_ops\`. It is qualified only against the build"
+            echo "runner's GTK and system libraries for now."
+            echo
+            echo "## Updates"
+            echo
+            echo "All four builds read the public alpha feed. Windows can use its"
+            echo "signed updater; Android, macOS and Linux currently open this"
+            echo "release page for a deliberate manual install."
           } > staged/NOTES.md
 
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -415,7 +476,8 @@ jobs:
             --title "Station Ops $VERSION" \
             --notes-file staged/NOTES.md \
             --draft $prerelease \
-            staged/*.exe staged/*.eddsa staged/*.zip staged/SHA256SUMS.txt
+            staged/*.exe staged/*.eddsa staged/*.zip staged/*.apk \
+            staged/*.tar.gz staged/SHA256SUMS.txt
 
           {
             echo "### Staged"
